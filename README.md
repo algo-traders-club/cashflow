@@ -131,7 +131,87 @@ python run_trading.py --config config/enhanced_config.yaml --api-port 9001
 - Pandas
 - NumPy
 - Prometheus Client
-└── README.md           # Setup and usage instructions
+
+## Docker Deployment
+
+The Cashflow trading agent can be easily deployed using Docker:
+
+```bash
+# Build and run with Docker
+docker build -t cashflow-trading .
+docker run -p 9001:9001 -v $(pwd)/config:/app/config -v $(pwd)/data:/app/data -v $(pwd)/logs:/app/logs cashflow-trading
+
+# Alternatively, use Docker Compose
+docker-compose up -d
+```
+
+The Docker container runs with the aggressive trading configuration by default. You can change this by setting the `CONFIG_FILE` environment variable:
+
+```bash
+docker run -p 9001:9001 -e CONFIG_FILE=config/config.yaml -v $(pwd)/config:/app/config cashflow-trading
+```
+
+## AWS Lightsail Deployment
+
+There are two ways to deploy the Cashflow trading agent to AWS Lightsail: automated deployment (requires full AWS Lightsail permissions) or manual deployment.
+
+### Automated Deployment
+
+1. Ensure you have the AWS CLI installed and configured with appropriate credentials that include the `AmazonLightsailFullAccess` policy
+
+2. Run the deployment script:
+
+```bash
+./deploy-lightsail.sh
+```
+
+This script will:
+- Build the Docker image locally
+- Create an AWS Lightsail container service if it doesn't exist
+- Push the Docker image to Lightsail
+- Deploy the container with the appropriate configuration
+- Output the public URL for accessing your trading agent
+
+### Manual Deployment
+
+If you don't have full AWS Lightsail permissions, you can use the manual deployment option:
+
+1. Run the deployment script with limited functionality:
+
+```bash
+./deploy-lightsail.sh
+```
+
+2. The script will detect limited permissions and create:
+   - A Docker image saved as `cashflow-trading.tar`
+   - A comprehensive manual deployment guide (`manual-deployment-guide.md`)
+   - A sample deployment configuration (`sample-deployment.json`)
+
+3. Follow the instructions in `manual-deployment-guide.md` to deploy through the AWS Lightsail Console
+
+### Deployment Configuration
+
+You can modify the `deploy-lightsail.sh` script to change:
+- AWS region (default: us-west-2)
+- Service name (default: cashflow-trading)
+- Instance size (default: micro_2_0 - 2GB RAM, 1 vCPU)
+- Port configuration (default: 9001)
+
+### Accessing Your Deployed Trading Agent
+
+Once deployed, you can access your trading agent at the URL provided by AWS Lightsail:
+
+- Status: `https://<your-lightsail-url>/status`
+- Debug: `https://<your-lightsail-url>/debug`
+- Portfolio: `https://<your-lightsail-url>/portfolio`
+
+To start/stop trading:
+```bash
+# Start trading
+curl -X POST https://<your-lightsail-url>/start
+
+# Stop trading
+curl -X POST https://<your-lightsail-url>/stop
 ```
 
 ## Setup
@@ -146,7 +226,7 @@ python run_trading.py --config config/enhanced_config.yaml --api-port 9001
 
 1. Clone the repository
    ```bash
-   git clone https://github.com/yourusername/cashflow.git
+   git clone https://github.com/botmechanic/cashflow.git
    cd cashflow
    ```
 

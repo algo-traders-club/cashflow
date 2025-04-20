@@ -1,0 +1,25 @@
+{
+  "containers": {
+    "cashflow-app": {
+      "image": "cashflow-trading.cashflow.latest",
+      "ports": {
+        "9001": "HTTP"
+      },
+      "environment": {
+        "CONFIG_FILE": "config/enhanced_config.yaml",
+        "API_PORT": "9001"
+      }
+    }
+  },
+  "publicEndpoint": {
+    "containerName": "cashflow-app",
+    "containerPort": 9001,
+    "healthCheck": {
+      "path": "/status",
+      "intervalSeconds": 30,
+      "timeoutSeconds": 10,
+      "unhealthyThreshold": 3,
+      "healthyThreshold": 3
+    }
+  }
+}

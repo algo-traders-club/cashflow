@@ -1,0 +1,23 @@
+version: '3'
+
+services:
+  cashflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9001:9001"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    environment:
+      - CONFIG_FILE=config/enhanced_config.yaml
+      - API_PORT=9001
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
