@@ -1,0 +1,2067 @@
+Directory Structure:
+
+└── ./
+    └── examples
+        ├── basic_adding.py
+        ├── basic_agent.py
+        ├── basic_builder_fee.py
+        ├── basic_convert_to_multi_sig_user.py
+        ├── basic_evm_use_big_blocks.py
+        ├── basic_leverage_adjustment.py
+        ├── basic_market_order.py
+        ├── basic_order_modify.py
+        ├── basic_order_with_cloid.py
+        ├── basic_order.py
+        ├── basic_schedule_cancel.py
+        ├── basic_set_referrer.py
+        ├── basic_spot_order.py
+        ├── basic_spot_to_perp.py
+        ├── basic_spot_transfer.py
+        ├── basic_staking.py
+        ├── basic_sub_account.py
+        ├── basic_tpsl.py
+        ├── basic_transfer.py
+        ├── basic_vault_transfer.py
+        ├── basic_vault.py
+        ├── basic_withdraw.py
+        ├── basic_ws.py
+        ├── cancel_open_orders.py
+        ├── evm_block_indexer.py
+        ├── evm_erc20.py
+        ├── example_utils.py
+        ├── multi_sig_order.py
+        ├── multi_sig_register_token.py
+        ├── multi_sig_usd_send.py
+        ├── rounding.py
+        └── spot_deploy.py
+
+
+
+---
+File: /examples/basic_adding.py
+---
+
+# This is an end to end example of a very basic adding strategy.
+import json
+import logging
+import threading
+import time
+
+import example_utils
+
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
+from hyperliquid.utils.signing import get_timestamp_ms
+from hyperliquid.utils.types import (
+    SIDES,
+    Dict,
+    L2BookData,
+    L2BookMsg,
+    L2BookSubscription,
+    Literal,
+    Optional,
+    Side,
+    TypedDict,
+    Union,
+    UserEventsMsg,
+    UserEventsSubscription,
+)
+
+# --------------------------- CONFIGURATION ---------------------------
+
+# How far from the best bid and offer this strategy ideally places orders. Currently set to 0.3%.
+# i.e., if the best bid is $1000, this strategy will place a resting bid at $997 (1000 - 0.3% of 1000).
+DEPTH = 0.003
+
+# How far from the target price a resting order can deviate before the strategy will cancel and replace it.
+# i.e., using the same example as above of a best bid of $1000 and targeted depth of 0.3% (a $3 difference).
+# Bids within $3 * 0.5 = $1.5 of the ideal price will not be cancelled. Therefore, any bids > $998.5 or < $995.5
+# will be cancelled and replaced.
+ALLOWABLE_DEVIATION = 0.5
+
+# The maximum absolute position value the strategy can accumulate in units of the coin.
+# i.e., the strategy will place orders such that it can long up to 1 ETH or short up to 1 ETH.
+MAX_POSITION = 1.0
+
+# The coin to add liquidity on.
+COIN = "ETH"
+
+# The interval (in seconds) at which the polling function runs.
+POLL_INTERVAL = 10
+
+# The maximum time (in milliseconds) to wait for an in-flight order before treating it as cancelled.
+ORDER_TIMEOUT = 10000
+
+# The time (in milliseconds) to keep recently cancelled orders before cleaning them up.
+CANCEL_CLEANUP_TIME = 30000
+
+# --------------------------- TYPE DEFINITIONS ---------------------------
+
+InFlightOrder = TypedDict("InFlightOrder", {"type": Literal["in_flight_order"], "time": int})
+Resting = TypedDict("Resting", {"type": Literal["resting"], "px": float, "oid": int})
+Cancelled = TypedDict("Cancelled", {"type": Literal["cancelled"]})
+ProvideState = Union[InFlightOrder, Resting, Cancelled]
+
+
+def side_to_int(side: Side) -> int:
+    """Convert side ('A' for Ask, 'B' for Bid) to an integer multiplier."""
+    return 1 if side == "A" else -1
+
+
+def side_to_uint(side: Side) -> int:
+    """Convert side ('A' for Ask, 'B' for Bid) to an unsigned integer (0 or 1)."""
+    return 1 if side == "A" else 0
+
+
+class BasicAdder:
+    def __init__(self, address: str, info: Info, exchange: Exchange):
+        self.info = info
+        self.exchange = exchange
+        self.address = address
+        self.position: Optional[float] = None
+        self.provide_state: Dict[Side, ProvideState] = {
+            "A": {"type": "cancelled"},
+            "B": {"type": "cancelled"},
+        }
+        self.recently_cancelled_oid_to_time: Dict[int, int] = {}
+
+        # Subscribe to updates
+        self.subscribe_to_updates()
+
+        # Start the polling thread
+        self.start_poller()
+
+    def subscribe_to_updates(self) -> None:
+        """Subscribe to order book and user event updates."""
+        l2_book_subscription: L2BookSubscription = {"type": "l2Book", "coin": COIN}
+        self.info.subscribe(l2_book_subscription, self.on_book_update)
+
+        user_events_subscription: UserEventsSubscription = {"type": "userEvents", "user": self.address}
+        self.info.subscribe(user_events_subscription, self.on_user_events)
+
+    def start_poller(self) -> None:
+        """Start the polling thread for checking open orders and positions."""
+        self.poller = threading.Thread(target=self.poll, daemon=True)
+        self.poller.start()
+
+    def on_book_update(self, book_msg: L2BookMsg) -> None:
+        """Callback for order book updates."""
+        logging.debug(f"Received book message: {book_msg}")
+        book_data = book_msg["data"]
+
+        if book_data["coin"] != COIN:
+            logging.warning("Unexpected book message, skipping.")
+            return
+
+        for side in SIDES:
+            self.handle_order_placement(side, book_data)
+
+    def handle_order_placement(self, side: Side, book_data: L2BookData) -> None:
+        """Handle the placement and cancellation of orders based on the order book update."""
+        book_price = float(book_data["levels"][side_to_uint(side)][0]["px"])
+        ideal_distance = book_price * DEPTH
+        ideal_price = book_price + (ideal_distance * side_to_int(side))
+
+        provide_state = self.provide_state[side]
+
+        if provide_state["type"] == "resting":
+            self.maybe_cancel_order(side, provide_state, ideal_price, ideal_distance)
+        elif provide_state["type"] == "in_flight_order":
+            self.check_in_flight_order(side, provide_state)
+
+        if provide_state["type"] == "cancelled":
+            self.place_new_order(side, ideal_price)
+
+    def maybe_cancel_order(self, side: Side, provide_state: Resting, ideal_price: float, ideal_distance: float) -> None:
+        """Cancel the order if it deviates beyond the allowable limit."""
+        distance = abs(ideal_price - provide_state["px"])
+        if distance > ALLOWABLE_DEVIATION * ideal_distance:
+            oid = provide_state["oid"]
+            print(f"Cancelling order due to deviation: oid:{oid}, side:{side}, ideal_price:{ideal_price}")
+            response = self.exchange.cancel(COIN, oid)
+            if response["status"] == "ok":
+                self.recently_cancelled_oid_to_time[oid] = get_timestamp_ms()
+                self.provide_state[side] = {"type": "cancelled"}
+            else:
+                logging.error(f"Failed to cancel order {oid} for side {side}: {response}")
+
+    def check_in_flight_order(self, side: Side, provide_state: InFlightOrder) -> None:
+        """Check if the in-flight order has timed out."""
+        if get_timestamp_ms() - provide_state["time"] > ORDER_TIMEOUT:
+            print("Order is still in flight after timeout, treating as cancelled.")
+            self.provide_state[side] = {"type": "cancelled"}
+
+    def place_new_order(self, side: Side, ideal_price: float) -> None:
+        """Place a new order if conditions are met."""
+        if self.position is None:
+            logging.debug("Waiting for position refresh before placing order.")
+            return
+
+        size = MAX_POSITION + self.position * side_to_int(side)
+        if size * ideal_price < 10:
+            logging.debug("Order size too small, not placing order.")
+            return
+
+        px = float(f"{ideal_price:.5g}")
+        print(f"Placing order: size:{size}, price:{px}, side:{side}")
+        response = self.exchange.order(COIN, side == "B", size, px, {"limit": {"tif": "Alo"}})
+        if response["status"] == "ok":
+            status = response["response"]["data"]["statuses"][0]
+            if "resting" in status:
+                self.provide_state[side] = {"type": "resting", "px": px, "oid": status["resting"]["oid"]}
+
+    def on_user_events(self, user_events: UserEventsMsg) -> None:
+        """Callback for user events (e.g., fills)."""
+        print(user_events)
+        if "fills" in user_events["data"]:
+            with open("fills", "a+") as f:
+                f.write(json.dumps(user_events["data"]["fills"]) + "\n")
+        # Set the position to None so that we don't place more orders without knowing our position
+        # You might want to also update provide_state to account for the fill. This could help avoid sending an
+        # unneeded cancel or failing to send a new order to replace the filled order, but we skipped this logic
+        # to make the example simpler
+        self.position = None
+
+    def poll(self) -> None:
+        """Poll open orders and user positions periodically."""
+        while True:
+            # Fetch open orders
+            open_orders = self.info.open_orders(self.exchange.wallet.address)
+            print("open_orders", open_orders)
+
+            # Collect valid order IDs (from recently cancelled orders and resting orders)
+            ok_oids = set(self.recently_cancelled_oid_to_time.keys())
+            for provide_state in self.provide_state.values():
+                if provide_state["type"] == "resting":
+                    ok_oids.add(provide_state["oid"])
+
+            # Cancel any unknown orders
+            for open_order in open_orders:
+                if open_order["coin"] == COIN and open_order["oid"] not in ok_oids:
+                    print("Cancelling unknown oid", open_order["oid"])
+                    self.exchange.cancel(open_order["coin"], open_order["oid"])
+
+            # Clean up recently cancelled orders after a timeout
+            current_time = get_timestamp_ms()
+            self.recently_cancelled_oid_to_time = {
+                oid: timestamp
+                for oid, timestamp in self.recently_cancelled_oid_to_time.items()
+                if current_time - timestamp <= CANCEL_CLEANUP_TIME
+            }
+            self.refresh_position()
+            time.sleep(POLL_INTERVAL)
+
+    def refresh_position(self) -> None:
+        """Refresh the user’s current position."""
+        user_state = self.info.user_state(self.address)
+        for position in user_state.get("assetPositions", []):
+            if position["position"]["coin"] == COIN:
+                self.position = float(position["position"]["szi"])
+                return
+        self.position = 0.0
+
+
+def main():
+    # Setting this to logging.DEBUG can be helpful for debugging websocket callback issues
+    logging.basicConfig(level=logging.INFO)
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL)
+    BasicAdder(address, info, exchange)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_agent.py
+---
+
+import eth_account
+import example_utils
+from eth_account.signers.local import LocalAccount
+
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
+
+
+def main():
+    """
+    Sets up an environment for testing purposes by creating an agent that can place trades on behalf of the account.
+    The agent does not have permission to transfer or withdraw funds. You can run this part on a separate machine or
+    change the code to connect the agent via a wallet app instead of using your private key directly in Python.
+    You can also create a named agent using the frontend, which persists the authorization under an agent name.
+
+    The main function then proceeds to place a test order with the agent and simulates the process of managing orders
+    and ensuring that orders that are no longer needed are cleaned up.
+    Finally, it creates an extra agent that persists beyond the current session and places an order with the extra agent.
+    """
+
+    # Set up the environment (exchange, account info, etc.) for testing purposes.
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    # Ensure that the wallet address and account address are the same.
+    # If these are not the same then an agent will be approved for the wallet address instead of the account address, and the order will fail.
+    if address != exchange.wallet.address:
+        raise Exception("You should not create an agent using an agent")
+
+    approve_result, agent_key = exchange.approve_agent()
+
+    # Check if the agent approval was successful. If not, log the error and return.
+    # This prevents proceeding with an agent that isn't properly authorized.
+    if approve_result["status"] != "ok":
+        print("approving agent failed", approve_result)
+        return
+
+    # Create the agent's local account using the agent's private key.
+    # We use `eth_account.Account.from_key()` to securely generate the agent's account from its private key.
+    agent_account: LocalAccount = eth_account.Account.from_key(agent_key)
+    print("Running with agent address:", agent_account.address)
+
+    # Create a new exchange instance for the agent, providing it with the agent's account information and exchange URL.
+    # This exchange object will be used for placing orders and interacting with the Hyperliquid API.
+    agent_exchange = Exchange(agent_account, constants.TESTNET_API_URL, account_address=address)
+
+    # Place a test order with the agent (setting a very low price so that it rests in the order book).
+    # The order is placed as a "limit" order with the time-in-force set to "Good till Cancelled" (GTC).
+    # This allows us to test placing an order without immediately executing it.
+    order_result = agent_exchange.order("ETH", True, 0.2, 1000, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+
+    # If the order was placed successfully and the status is "resting," we attempt to cancel it.
+    # This simulates the process of managing orders and ensuring that orders are no longer needed are cleaned up.
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            cancel_result = agent_exchange.cancel("ETH", status["resting"]["oid"])
+            print(cancel_result)
+
+    # Create an extra agent that persists beyond the current session.
+    # The "persist" argument ensures that the agent remains available for future interactions and doesn't require re-approval each time.
+
+    approve_result, extra_agent_key = exchange.approve_agent("persist")
+
+    # Check if the extra agent was successfully approved.
+    if approve_result["status"] != "ok":
+        print("approving extra agent failed", approve_result)
+        return
+
+    # Create the extra agent account using its private key and the same process as above.
+    extra_agent_account: LocalAccount = eth_account.Account.from_key(extra_agent_key)
+    extra_agent_exchange = Exchange(extra_agent_account, constants.TESTNET_API_URL, account_address=address)
+    print("Running with extra agent address:", extra_agent_account.address)
+
+    # Place an order with the extra agent using the same process as the original agent.
+    print("Placing order with extra agent")
+    order_result = extra_agent_exchange.order("ETH", True, 0.2, 1000, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+
+    # If the extra agent's order is placed successfully, attempt to cancel it.
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            print("Canceling order with extra agent")
+            cancel_result = extra_agent_exchange.cancel("ETH", status["resting"]["oid"])
+            print(cancel_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_builder_fee.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    if exchange.account_address != exchange.wallet.address:
+        raise Exception("Only the main wallet has permission to approve a builder fee")
+
+    # approve setting a builder fee
+    approve_result = exchange.approve_builder_fee("0x8c967E73E7B15087c42A10D344cFf4c96D877f1D", "0.001%")
+    print(approve_result)
+
+    # place an order with builder set, this will cause an additional fee to be added to the order which is sent to the builder
+    order_result = exchange.market_open(
+        "ETH", True, 0.05, None, 0.01, builder={"b": "0x8c967E73E7B15087c42A10D344cFf4c96D877f1D", "f": 1}
+    )
+    print(order_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_convert_to_multi_sig_user.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    if exchange.account_address != exchange.wallet.address:
+        raise Exception("Agents do not have permission to convert to multi-sig user")
+
+    # Authorized users are the public addresses of the wallets that will be able to sign on behalf of the multi-sig user.
+    # Some additional notes:
+    # Only existing users may be used. In other words, the authorized users must have deposited. Otherwise this conversion will fail.
+    # The multi-sig signatures must be generated by the authorized user's wallet. Agent/API wallets cannot be used.
+    authorized_user_1 = "0x0000000000000000000000000000000000000000"
+    authorized_user_2 = "0x0000000000000000000000000000000000000001"
+    threshold = 1
+    convert_result = exchange.convert_to_multi_sig_user([authorized_user_1, authorized_user_2], threshold)
+    print(convert_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_evm_use_big_blocks.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+# This example shows how to switch an account to use big blocks on the EVM
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    print(exchange.use_big_blocks(True))
+    print(exchange.use_big_blocks(False))
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_leverage_adjustment.py
+---
+
+import json
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    # Get the user state and print out leverage information for ETH
+    user_state = info.user_state(address)
+    for asset_position in user_state["assetPositions"]:
+        if asset_position["position"]["coin"] == "ETH":
+            print("Current leverage for ETH:", json.dumps(asset_position["position"]["leverage"], indent=2))
+
+    # Set the ETH leverage to 21x (cross margin)
+    print(exchange.update_leverage(21, "ETH"))
+
+    # Set the ETH leverage to 22x (isolated margin)
+    print(exchange.update_leverage(21, "ETH", False))
+
+    # Add 1 dollar of extra margin to the ETH position
+    print(exchange.update_isolated_margin(1, "ETH"))
+
+    # Get the user state and print out the final leverage information after our changes
+    user_state = info.user_state(address)
+    for asset_position in user_state["assetPositions"]:
+        if asset_position["position"]["coin"] == "ETH":
+            print("Current leverage for ETH:", json.dumps(asset_position["position"]["leverage"], indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_market_order.py
+---
+
+import time
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    coin = "ETH"
+    is_buy = False
+    sz = 0.05
+
+    print(f"We try to Market {'Buy' if is_buy else 'Sell'} {sz} {coin}.")
+
+    order_result = exchange.market_open(coin, is_buy, sz, None, 0.01)
+    if order_result["status"] == "ok":
+        for status in order_result["response"]["data"]["statuses"]:
+            try:
+                filled = status["filled"]
+                print(f'Order #{filled["oid"]} filled {filled["totalSz"]} @{filled["avgPx"]}')
+            except KeyError:
+                print(f'Error: {status["error"]}')
+
+        print("We wait for 2s before closing")
+        time.sleep(2)
+
+        print(f"We try to Market Close all {coin}.")
+        order_result = exchange.market_close(coin)
+        if order_result["status"] == "ok":
+            for status in order_result["response"]["data"]["statuses"]:
+                try:
+                    filled = status["filled"]
+                    print(f'Order #{filled["oid"]} filled {filled["totalSz"]} @{filled["avgPx"]}')
+                except KeyError:
+                    print(f'Error: {status["error"]}')
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_order_modify.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+from hyperliquid.utils.types import Cloid
+
+
+def main():
+    address, info, exchange = example_utils.setup(base_url=constants.TESTNET_API_URL, skip_ws=True)
+
+    cloid = Cloid.from_str("0x00000000000000000000000000000001")
+    # Place an order that should rest by setting the price very low
+    order_result = exchange.order("ETH", True, 0.2, 1100, {"limit": {"tif": "Gtc"}}, cloid=cloid)
+    print(order_result)
+
+    # Modify the order by oid
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            oid = status["resting"]["oid"]
+            order_status = info.query_order_by_oid(address, oid)
+            print("Order status by oid:", order_status)
+
+            modify_result = exchange.modify_order(oid, "ETH", True, 0.1, 1105, {"limit": {"tif": "Gtc"}}, cloid=cloid)
+            print("modify result with oid:", modify_result)
+
+            modify_result = exchange.modify_order(cloid, "ETH", True, 0.1, 1105, {"limit": {"tif": "Gtc"}})
+            print("modify result with cloid:", modify_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_order_with_cloid.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+from hyperliquid.utils.types import Cloid
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    cloid = Cloid.from_str("0x00000000000000000000000000000001")
+    # Users can also generate a cloid from an int
+    # cloid = Cloid.from_int(1)
+    # Place an order that should rest by setting the price very low
+    order_result = exchange.order("ETH", True, 0.2, 1100, {"limit": {"tif": "Gtc"}}, cloid=cloid)
+    print(order_result)
+
+    # Query the order status by cloid
+    order_status = info.query_order_by_cloid(address, cloid)
+    print("Order status by cloid:", order_status)
+
+    # Non-existent cloid example
+    invalid_cloid = Cloid.from_int(2)
+    order_status = info.query_order_by_cloid(address, invalid_cloid)
+    print("Order status by cloid:", order_status)
+
+    # Cancel the order by cloid
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            cancel_result = exchange.cancel_by_cloid("ETH", cloid)
+            print(cancel_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_order.py
+---
+
+import json
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(base_url=constants.TESTNET_API_URL, skip_ws=True)
+
+    # Get the user state and print out position information
+    user_state = info.user_state(address)
+    positions = []
+    for position in user_state["assetPositions"]:
+        positions.append(position["position"])
+    if len(positions) > 0:
+        print("positions:")
+        for position in positions:
+            print(json.dumps(position, indent=2))
+    else:
+        print("no open positions")
+
+    # Place an order that should rest by setting the price very low
+    order_result = exchange.order("ETH", True, 0.2, 1100, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+
+    # Query the order status by oid
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            order_status = info.query_order_by_oid(address, status["resting"]["oid"])
+            print("Order status by oid:", order_status)
+
+    # Cancel the order
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            cancel_result = exchange.cancel("ETH", status["resting"]["oid"])
+            print(cancel_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_schedule_cancel.py
+---
+
+import time
+
+import example_utils
+
+from hyperliquid.utils import constants
+from hyperliquid.utils.signing import get_timestamp_ms
+
+
+def main():
+    address, info, exchange = example_utils.setup(base_url=constants.TESTNET_API_URL, skip_ws=True)
+
+    # Place an order that should rest by setting the price very low
+    order_result = exchange.order("ETH", True, 0.2, 1100, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+
+    # Query the order status by oid
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            order_status = info.query_order_by_oid(address, status["resting"]["oid"])
+            print("Order status by oid:", order_status)
+
+    # Schedule cancel
+    cancel_time = get_timestamp_ms() + 10000  # 10 seconds from now
+    print(exchange.schedule_cancel(cancel_time))
+
+    time.sleep(10)
+    print("open orders:", info.open_orders(address))
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_set_referrer.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    # Set the referrer code, for non-subaccount and non-vault addresses
+    print(exchange.set_referrer("ASDFASDF"))
+
+    referral_state = info.query_referral_state(address)
+    if "referredBy" in referral_state:
+        print("referred by", referral_state["referredBy"])
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_spot_order.py
+---
+
+import json
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+PURR = "PURR/USDC"
+OTHER_COIN = "@8"
+OTHER_COIN_NAME = "KORILA/USDC"
+
+
+def main():
+    address, info, exchange = example_utils.setup(base_url=constants.TESTNET_API_URL, skip_ws=True)
+
+    # Get the user state and print out position information
+    spot_user_state = info.spot_user_state(address)
+    if len(spot_user_state["balances"]) > 0:
+        print("spot balances:")
+        for balance in spot_user_state["balances"]:
+            print(json.dumps(balance, indent=2))
+    else:
+        print("no available token balances")
+
+    # Place an order that should rest by setting the price very low
+    order_result = exchange.order(PURR, True, 24, 0.5, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+
+    # Query the order status by oid
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            order_status = info.query_order_by_oid(address, status["resting"]["oid"])
+            print("Order status by oid:", order_status)
+
+    # Cancel the order
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            cancel_result = exchange.cancel(PURR, status["resting"]["oid"])
+            print(cancel_result)
+
+    # For other spot assets other than PURR/USDC use @{index} e.g. on testnet @8 is KORILA/USDC
+    order_result = exchange.order(OTHER_COIN, True, 1, 12, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            # The sdk now also support using spot names, although be careful as they might not always be unique
+            cancel_result = exchange.cancel(OTHER_COIN_NAME, status["resting"]["oid"])
+            print(cancel_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_spot_to_perp.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    # Transfer 1.23 USDC from perp wallet to spot wallet
+    transfer_result = exchange.usd_class_transfer(1.23, False)
+    print(transfer_result)
+
+    # Transfer 1.23 USDC from spot wallet to perp wallet
+    transfer_result = exchange.usd_class_transfer(1.23, True)
+    print(transfer_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_spot_transfer.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    if exchange.account_address != exchange.wallet.address:
+        raise Exception("Agents do not have permission to perform internal transfers")
+
+    # Transfer 1 PURR token to the zero address for demonstration purposes
+    transfer_result = exchange.spot_transfer(
+        1, "0x0000000000000000000000000000000000000000", "PURR:0xc4bf3f870c0e9465323c0b6ed28096c2"
+    )
+    print(transfer_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_staking.py
+---
+
+import json
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(base_url=constants.MAINNET_API_URL, skip_ws=True)
+
+    # Get the user staking summary and print information
+    user_staking_summary = info.user_staking_summary(address)
+    print("Staking summary:")
+    print(json.dumps(user_staking_summary, indent=2))
+
+    # Get the user staking delegations and print information
+    user_stakes = info.user_stakes(address)
+    print("Staking breakdown:")
+    print(json.dumps(user_stakes, indent=2))
+
+    # Get the user staking reward history and print information
+    user_staking_rewards = info.user_staking_rewards(address)
+    print("Most recent staking rewards:")
+    print(json.dumps(user_staking_rewards[:5], indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_sub_account.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+# This example shows how to create, query, and transfer funds to a subaccount.
+# To trade as a subaccount set vault_address to the subaccount's address. See basic_vault.py for an example.
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    name = "example123"
+    print(exchange.create_sub_account(name))
+
+    sub_accounts = info.query_sub_accounts(address)
+    for sub_account in sub_accounts:
+        if sub_account["name"] == name:
+            sub_account_user = sub_account["subAccountUser"]
+
+    # Transfer 1 USD to the subaccount
+    print(exchange.sub_account_transfer(sub_account_user, True, 1_000_000))
+    # Transfer 1.23 HYPE to the subaccount (the token string assumes testnet, the address needs to be changed for mainnet)
+    print(exchange.sub_account_spot_transfer(sub_account_user, True, "HYPE:0x7317beb7cceed72ef0b346074cc8e7ab", 1.23))
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_tpsl.py
+---
+
+import argparse
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    parser = argparse.ArgumentParser(description="basic_tpsl")
+    parser.add_argument("--is_buy", action="store_true")
+    args = parser.parse_args()
+
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    is_buy = args.is_buy
+    # Place an order that should execute by setting the price very aggressively
+    order_result = exchange.order("ETH", is_buy, 0.02, 2500 if is_buy else 1500, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+
+    # Place a stop order
+    stop_order_type = {"trigger": {"triggerPx": 1600 if is_buy else 2400, "isMarket": True, "tpsl": "sl"}}
+    stop_result = exchange.order("ETH", not is_buy, 0.02, 1500 if is_buy else 2500, stop_order_type, reduce_only=True)
+    print(stop_result)
+
+    # Cancel the order
+    if stop_result["status"] == "ok":
+        status = stop_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            cancel_result = exchange.cancel("ETH", status["resting"]["oid"])
+            print(cancel_result)
+
+    # Place a tp order
+    tp_order_type = {"trigger": {"triggerPx": 1600 if is_buy else 2400, "isMarket": True, "tpsl": "tp"}}
+    tp_result = exchange.order("ETH", not is_buy, 0.02, 2500 if is_buy else 1500, tp_order_type, reduce_only=True)
+    print(tp_result)
+
+    # Cancel the order
+    if tp_result["status"] == "ok":
+        status = tp_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            cancel_result = exchange.cancel("ETH", status["resting"]["oid"])
+            print(cancel_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_transfer.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    if exchange.account_address != exchange.wallet.address:
+        raise Exception("Agents do not have permission to perform internal transfers")
+
+    # Transfer 1 usd to the zero address for demonstration purposes
+    transfer_result = exchange.usd_transfer(1, "0x0000000000000000000000000000000000000000")
+    print(transfer_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_vault_transfer.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+    testnet_HLP_vault = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0"
+
+    # Transfer 5 usd to the HLP Vault for demonstration purposes
+    transfer_result = exchange.vault_usd_transfer(testnet_HLP_vault, True, 5_000_000)
+    print(transfer_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_vault.py
+---
+
+import example_utils
+
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    # Change this address to a vault that you lead or a subaccount that you own
+    vault = "0x1719884eb866cb12b2287399b15f7db5e7d775ea"
+
+    # Place an order that should rest by setting the price very low
+    exchange = Exchange(exchange.wallet, exchange.base_url, vault_address=vault)
+    order_result = exchange.order("ETH", True, 0.2, 1100, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+
+    # Cancel the order
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            cancel_result = exchange.cancel("ETH", status["resting"]["oid"])
+            print(cancel_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_withdraw.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+    if exchange.account_address != exchange.wallet.address:
+        raise Exception("Agents do not have permission to perform withdrawals")
+
+    # Withdraw 2 usd (note the amount received will be reduced by the fee)
+    withdraw_result = exchange.withdraw_from_bridge(2, address)
+    print(withdraw_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/basic_ws.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, _ = example_utils.setup(constants.TESTNET_API_URL)
+    # An example showing how to subscribe to the different subscription types and prints the returned messages
+    # Some subscriptions do not return snapshots, so you will not receive a message until something happens
+    info.subscribe({"type": "allMids"}, print)
+    info.subscribe({"type": "l2Book", "coin": "ETH"}, print)
+    info.subscribe({"type": "trades", "coin": "PURR/USDC"}, print)
+    info.subscribe({"type": "userEvents", "user": address}, print)
+    info.subscribe({"type": "userFills", "user": address}, print)
+    info.subscribe({"type": "candle", "coin": "ETH", "interval": "1m"}, print)
+    info.subscribe({"type": "orderUpdates", "user": address}, print)
+    info.subscribe({"type": "userFundings", "user": address}, print)
+    info.subscribe({"type": "userNonFundingLedgerUpdates", "user": address}, print)
+    info.subscribe({"type": "webData2", "user": address}, print)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/cancel_open_orders.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    open_orders = info.open_orders(address)
+    for open_order in open_orders:
+        print(f"cancelling order {open_order}")
+        exchange.cancel(open_order["coin"], open_order["oid"])
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/evm_block_indexer.py
+---
+
+from typing import Any
+
+import argparse
+import json
+import os
+from datetime import datetime
+
+import lz4.frame
+import msgpack
+
+
+def decompress_lz4(input_file, output_file):
+    with open(input_file, "rb") as f_in:
+        compressed_data = f_in.read()
+
+    decompressed_data = lz4.frame.decompress(compressed_data)
+
+    with open(output_file, "wb") as f_out:
+        f_out.write(decompressed_data)
+
+
+class BytesEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, bytes):
+            return "0x" + obj.hex()
+        return super().default(obj)
+
+
+class EthBlockIndexer:
+    def __init__(self):
+        self.blocks = []
+
+    # convert a Buffer object to hex string
+    def _convert_buffer(self, buffer_obj: dict[str, Any]) -> str:
+        if isinstance(buffer_obj, dict) and buffer_obj.get("type") == "Buffer":
+            return "0x" + "".join(f"{x:02x}" for x in buffer_obj["data"])
+        return str(buffer_obj)
+
+    # recursively process nested Buffer objects
+    def _process_nested_buffers(self, data: Any) -> Any:
+        if isinstance(data, dict):
+            if data.get("type") == "Buffer":
+                return self._convert_buffer(data)
+            return {k: self._process_nested_buffers(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self._process_nested_buffers(item) for item in data]
+        elif isinstance(data, bytes):
+            return "0x" + data.hex()
+        return data
+
+    def _bytes_to_int(self, value: Any) -> int:
+        if isinstance(value, dict) and value.get("type") == "Buffer":
+            raw_bytes = bytes(value["data"])
+            return int.from_bytes(raw_bytes, byteorder="big")
+        elif isinstance(value, bytes):
+            return int.from_bytes(value, byteorder="big")
+        return 0
+
+    def _process_transaction(self, tx: dict[str, Any]) -> dict[str, Any]:
+        if not tx.get("transaction"):
+            return {}
+
+        tx_data = tx["transaction"]
+        tx_type = next(iter(tx_data.keys()))  # Either 'Legacy' or 'Eip1559'
+        tx_content = tx_data[tx_type]
+
+        processed = {
+            "type": tx_type,
+            "chainId": self._bytes_to_int(tx_content.get("chainId", {"type": "Buffer", "data": []})),
+            "nonce": self._bytes_to_int(tx_content.get("nonce", {"type": "Buffer", "data": []})),
+            "gas": self._bytes_to_int(tx_content.get("gas", {"type": "Buffer", "data": []})),
+            "to": self._process_nested_buffers(tx_content.get("to")),
+            "value": self._bytes_to_int(tx_content.get("value", {"type": "Buffer", "data": []})),
+            "input": self._process_nested_buffers(tx_content.get("input")),
+            "signature": [self._process_nested_buffers(sig) for sig in tx.get("signature", [])],
+        }
+
+        if tx_type == "Legacy":
+            processed["gasPrice"] = self._bytes_to_int(tx_content.get("gasPrice", {"type": "Buffer", "data": []}))
+        elif tx_type == "Eip1559":
+            processed.update(
+                {
+                    "maxFeePerGas": self._bytes_to_int(tx_content.get("maxFeePerGas", {"type": "Buffer", "data": []})),
+                    "maxPriorityFeePerGas": self._bytes_to_int(
+                        tx_content.get("maxPriorityFeePerGas", {"type": "Buffer", "data": []})
+                    ),
+                    "accessList": self._process_nested_buffers(tx_content.get("accessList", [])),
+                }
+            )
+
+        return processed
+
+    def _process_block(self, block_data: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(block_data, dict) or "block" not in block_data:
+            raise ValueError("invalid block format")
+
+        reth_block = block_data["block"]["Reth115"]
+        header = reth_block.get("header", {}).get("header", {})
+
+        processed_block = {
+            "hash": self._process_nested_buffers(reth_block["header"].get("hash")),
+            "parentHash": self._process_nested_buffers(header.get("parentHash")),
+            "sha3Uncles": self._process_nested_buffers(header.get("sha3Uncles")),
+            "miner": self._process_nested_buffers(header.get("miner")),
+            "stateRoot": self._process_nested_buffers(header.get("stateRoot")),
+            "transactionsRoot": self._process_nested_buffers(header.get("transactionsRoot")),
+            "receiptsRoot": self._process_nested_buffers(header.get("receiptsRoot")),
+            "number": self._bytes_to_int(header.get("number", {"type": "Buffer", "data": []})),
+            "gasLimit": self._bytes_to_int(header.get("gasLimit", {"type": "Buffer", "data": []})),
+            "gasUsed": self._bytes_to_int(header.get("gasUsed", {"type": "Buffer", "data": []})),
+            "timestamp": self._bytes_to_int(header.get("timestamp", {"type": "Buffer", "data": []})),
+            "extraData": self._process_nested_buffers(header.get("extraData")),
+            "baseFeePerGas": self._bytes_to_int(header.get("baseFeePerGas", {"type": "Buffer", "data": []})),
+            "transactions": [
+                self._process_transaction(tx) for tx in reth_block.get("body", {}).get("transactions", [])
+            ],
+        }
+
+        if processed_block["timestamp"]:
+            processed_block["datetime"] = datetime.fromtimestamp(processed_block["timestamp"]).isoformat()
+        else:
+            processed_block["datetime"] = None
+
+        return processed_block
+
+    def process_msgpack_file(self, filename: str) -> None:
+        with open(filename, "rb") as f:
+            data = msgpack.load(f)
+            if isinstance(data, list):
+                for block_data in data:
+                    processed_block = self._process_block(block_data)
+                    self.blocks.append(processed_block)
+            else:
+                processed_block = self._process_block(data)
+                self.blocks.append(processed_block)
+
+    def save_to_json(self, output_filename: str) -> None:
+        with open(output_filename, "w") as f:
+            json.dump(
+                {
+                    "blocks": self.blocks,
+                    "totalBlocks": len(self.blocks),
+                    "totalTransactions": sum(len(block["transactions"]) for block in self.blocks),
+                },
+                f,
+                indent=2,
+                cls=BytesEncoder,
+            )
+
+    def summarize_blocks(self) -> dict[str, Any]:
+        if not self.blocks:
+            return {"error": "no blocks processed"}
+
+        total_gas_used = sum(block["gasUsed"] for block in self.blocks)
+        total_txs = sum(len(block["transactions"]) for block in self.blocks)
+
+        return {
+            "totalBlocks": len(self.blocks),
+            "totalTransactions": total_txs,
+            "averageGasUsed": total_gas_used / len(self.blocks) if self.blocks else 0,
+            "blockNumbers": [block["number"] for block in self.blocks],
+            "timeRange": {
+                "first": next((b["datetime"] for b in self.blocks if b["datetime"]), None),
+                "last": next((b["datetime"] for b in reversed(self.blocks) if b["datetime"]), None),
+            },
+        }
+
+
+if __name__ == "__main__":
+    # Download ethereum block files from s3://hl-[testnet|mainnet]-evm-blocks
+    # and input them into the indexer
+    parser = argparse.ArgumentParser(description="index evm blocks")
+    parser.add_argument("--data-dir", type=str, required=True)
+    parser.add_argument("--start-height", type=int, required=True)
+    parser.add_argument("--end-height", type=int, required=True)
+    args = parser.parse_args()
+
+    data_dir = args.data_dir
+    start_height = args.start_height
+    end_height = args.end_height
+    mp_flns = []
+    for height in range(start_height, end_height + 1):
+        lz4_fln = f"{data_dir}/{height}.rmp.lz4"
+        if not os.path.exists(lz4_fln):
+            raise Exception(
+                f"block with height {height} not found - download missing block file(s) using 'aws s3 cp s3://hl-[testnet | mainnet]-evm-blocks/<block_object_path> --request-payer requester'"
+            )
+        mp_fln = f"{data_dir}/{height}.rmp"
+        decompress_lz4(lz4_fln, mp_fln)
+        mp_flns.append(mp_fln)
+
+    indexer = EthBlockIndexer()
+    for mp_fln in mp_flns:
+        indexer.process_msgpack_file(mp_fln)
+    print(indexer.summarize_blocks())
+    indexer.save_to_json(f"{data_dir}/processed_blocks.json")
+
+
+
+---
+File: /examples/evm_erc20.py
+---
+
+from typing import Literal, TypedDict, Union
+
+import requests
+from eth_account import Account
+from eth_account.signers.local import LocalAccount
+from web3 import Web3
+from web3.middleware import SignAndSendRawMiddlewareBuilder
+
+from hyperliquid.utils import constants
+from hyperliquid.utils.signing import get_timestamp_ms, sign_l1_action
+
+
+class CreateInputParams(TypedDict):
+    nonce: int
+
+
+class CreateInput(TypedDict):
+    create: CreateInputParams
+
+
+FinalizeEvmContractInput = Union[Literal["firstStorageSlot"], CreateInput]
+
+
+class FinalizeEvmContractAction(TypedDict):
+    type: Literal["finalizeEvmContract"]
+    token: int
+    input: FinalizeEvmContractInput
+
+
+SHOULD_DEPLOY_CONTRACT = True  # change this if you are happy with your deployed contract and want to skip this
+SHOULD_LINK_CONTRACT = False  # change this to True if you want to link your token, this process is not reversible!
+DEFAULT_CONTRACT_ADDRESS = Web3.to_checksum_address(
+    "0x8cDE56336E289c028C8f7CF5c20283fF02272182"  # change this to your contract address if you are skipping deploying
+)
+TOKEN = 1  # note that if changing this you likely should also change the abi to have a different name and perhaps also different decimals and initial supply
+PRIVATE_KEY = "0xPRIVATE_KEY"  # Change this to your private key
+
+# Connect to the JSON-RPC endpoint
+rpc_url = "https://rpc.hyperliquid-testnet.xyz/evm"
+w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+# The account will be used both for deploying the ERC20 contract and linking it to your native spot asset
+# You can also switch this to create an account a different way if you don't want to include a secret key in code
+if PRIVATE_KEY == "0xPRIVATE_KEY":
+    raise Exception("must set private key or create account another way")
+account: LocalAccount = Account.from_key(PRIVATE_KEY)
+print(f"Running with address {account.address}")
+w3.middleware_onion.add(SignAndSendRawMiddlewareBuilder.build(account))
+w3.eth.default_account = account.address
+# Verify connection
+if not w3.is_connected():
+    raise Exception("Failed to connect to the Ethereum network")
+
+purr_abi = {
+    "_format": "hh-sol-artifact-1",
+    "contractName": "Purr",
+    "sourceName": "contracts/Purr.sol",
+    "abi": [
+        {"inputs": [], "stateMutability": "nonpayable", "type": "constructor"},
+        {
+            "anonymous": False,
+            "inputs": [
+                {"indexed": True, "internalType": "address", "name": "owner", "type": "address"},
+                {"indexed": True, "internalType": "address", "name": "spender", "type": "address"},
+                {"indexed": False, "internalType": "uint256", "name": "value", "type": "uint256"},
+            ],
+            "name": "Approval",
+            "type": "event",
+        },
+        {
+            "anonymous": False,
+            "inputs": [
+                {"indexed": True, "internalType": "address", "name": "previousOwner", "type": "address"},
+                {"indexed": True, "internalType": "address", "name": "newOwner", "type": "address"},
+            ],
+            "name": "OwnershipTransferred",
+            "type": "event",
+        },
+        {
+            "anonymous": False,
+            "inputs": [
+                {"indexed": True, "internalType": "address", "name": "from", "type": "address"},
+                {"indexed": True, "internalType": "address", "name": "to", "type": "address"},
+                {"indexed": False, "internalType": "uint256", "name": "value", "type": "uint256"},
+            ],
+            "name": "Transfer",
+            "type": "event",
+        },
+        {
+            "inputs": [],
+            "name": "DOMAIN_SEPARATOR",
+            "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "owner", "type": "address"},
+                {"internalType": "address", "name": "spender", "type": "address"},
+            ],
+            "name": "allowance",
+            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "spender", "type": "address"},
+                {"internalType": "uint256", "name": "amount", "type": "uint256"},
+            ],
+            "name": "approve",
+            "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
+            "name": "balanceOf",
+            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [],
+            "name": "decimals",
+            "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "spender", "type": "address"},
+                {"internalType": "uint256", "name": "subtractedValue", "type": "uint256"},
+            ],
+            "name": "decreaseAllowance",
+            "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "spender", "type": "address"},
+                {"internalType": "uint256", "name": "addedValue", "type": "uint256"},
+            ],
+            "name": "increaseAllowance",
+            "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [{"internalType": "uint256", "name": "amount", "type": "uint256"}],
+            "name": "mint",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [],
+            "name": "name",
+            "outputs": [{"internalType": "string", "name": "", "type": "string"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+            "name": "nonces",
+            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [],
+            "name": "owner",
+            "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "owner", "type": "address"},
+                {"internalType": "address", "name": "spender", "type": "address"},
+                {"internalType": "uint256", "name": "value", "type": "uint256"},
+                {"internalType": "uint256", "name": "deadline", "type": "uint256"},
+                {"internalType": "uint8", "name": "v", "type": "uint8"},
+                {"internalType": "bytes32", "name": "r", "type": "bytes32"},
+                {"internalType": "bytes32", "name": "s", "type": "bytes32"},
+            ],
+            "name": "permit",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {"inputs": [], "name": "renounceOwnership", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+        {
+            "inputs": [],
+            "name": "symbol",
+            "outputs": [{"internalType": "string", "name": "", "type": "string"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [],
+            "name": "totalSupply",
+            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "to", "type": "address"},
+                {"internalType": "uint256", "name": "amount", "type": "uint256"},
+            ],
+            "name": "transfer",
+            "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "from", "type": "address"},
+                {"internalType": "address", "name": "to", "type": "address"},
+                {"internalType": "uint256", "name": "amount", "type": "uint256"},
+            ],
+            "name": "transferFrom",
+            "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [{"internalType": "address", "name": "newOwner", "type": "address"}],
+            "name": "transferOwnership",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+    ],
+    "bytecode": "0x6101406040523480156200001257600080fd5b5060405180604001604052806004815260200163282aa92960e11b81525080604051806040016040528060018152602001603160f81b81525060405180604001604052806004815260200163282aa92960e11b81525060405180604001604052806004815260200163282aa92960e11b81525081600390805190602001906200009d929190620001aa565b508051620000b3906004906020840190620001aa565b5050825160209384012082519284019290922060e08390526101008190524660a0818152604080517f8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f818901819052818301979097526060810194909452608080850193909352308483018190528151808603909301835260c09485019091528151919096012090529290925261012052506200015290503362000158565b6200028d565b600780546001600160a01b038381166001600160a01b0319831681179093556040519116919082907f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e090600090a35050565b828054620001b89062000250565b90600052602060002090601f016020900481019282620001dc576000855562000227565b82601f10620001f757805160ff191683800117855562000227565b8280016001018555821562000227579182015b82811115620002275782518255916020019190600101906200020a565b506200023592915062000239565b5090565b5b808211156200023557600081556001016200023a565b600181811c908216806200026557607f821691505b602082108114156200028757634e487b7160e01b600052602260045260246000fd5b50919050565b60805160a05160c05160e051610100516101205161198c620002dd6000396000610dc701526000610e1601526000610df101526000610d4a01526000610d7401526000610d9e015261198c6000f3fe608060405234801561001057600080fd5b50600436106101365760003560e01c80637ecebe00116100b2578063a457c2d711610081578063d505accf11610066578063d505accf14610287578063dd62ed3e1461029a578063f2fde38b146102e057600080fd5b8063a457c2d714610261578063a9059cbb1461027457600080fd5b80637ecebe001461020b5780638da5cb5b1461021e57806395d89b4114610246578063a0712d681461024e57600080fd5b8063313ce5671161010957806339509351116100ee57806339509351146101b857806370a08231146101cb578063715018a61461020157600080fd5b8063313ce567146101a15780633644e515146101b057600080fd5b806306fdde031461013b578063095ea7b31461015957806318160ddd1461017c57806323b872dd1461018e575b600080fd5b6101436102f3565b6040516101509190611698565b60405180910390f35b61016c610167366004611734565b610385565b6040519015158152602001610150565b6002545b604051908152602001610150565b61016c61019c36600461175e565b61039d565b60405160088152602001610150565b6101806103c1565b61016c6101c6366004611734565b6103d0565b6101806101d936600461179a565b73ffffffffffffffffffffffffffffffffffffffff1660009081526020819052604090205490565b61020961041c565b005b61018061021936600461179a565b610430565b60075460405173ffffffffffffffffffffffffffffffffffffffff9091168152602001610150565b61014361045d565b61020961025c3660046117bc565b61046c565b61016c61026f366004611734565b61049b565b61016c610282366004611734565b610571565b6102096102953660046117d5565b61057f565b6101806102a8366004611848565b73ffffffffffffffffffffffffffffffffffffffff918216600090815260016020908152604080832093909416825291909152205490565b6102096102ee36600461179a565b61073e565b6060600380546103029061187b565b80601f016020809104026020016040519081016040528092919081815260200182805461032e9061187b565b801561037b5780601f106103505761010080835404028352916020019161037b565b820191906000526020600020905b81548152906001019060200180831161035e57829003601f168201915b5050505050905090565b6000336103938185856107f2565b5060019392505050565b6000336103ab8582856109a6565b6103b6858585610a7d565b506001949350505050565b60006103cb610d30565b905090565b33600081815260016020908152604080832073ffffffffffffffffffffffffffffffffffffffff8716845290915281205490919061039390829086906104179087906118f8565b6107f2565b610424610e64565b61042e6000610ee5565b565b73ffffffffffffffffffffffffffffffffffffffff81166000908152600560205260408120545b92915050565b6060600480546103029061187b565b610474610e64565b3360008181526020819052604090205461048e9190610f5c565b6104983382611141565b50565b33600081815260016020908152604080832073ffffffffffffffffffffffffffffffffffffffff8716845290915281205490919083811015610564576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602560248201527f45524332303a2064656372656173656420616c6c6f77616e63652062656c6f7760448201527f207a65726f00000000000000000000000000000000000000000000000000000060648201526084015b60405180910390fd5b6103b682868684036107f2565b600033610393818585610a7d565b834211156105e9576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601d60248201527f45524332305065726d69743a206578706972656420646561646c696e65000000604482015260640161055b565b60007f6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c98888886106188c611261565b60408051602081019690965273ffffffffffffffffffffffffffffffffffffffff94851690860152929091166060840152608083015260a082015260c0810186905260e001604051602081830303815290604052805190602001209050600061068082611296565b90506000610690828787876112ff565b90508973ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614610727576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601e60248201527f45524332305065726d69743a20696e76616c6964207369676e61747572650000604482015260640161055b565b6107328a8a8a6107f2565b50505050505050505050565b610746610e64565b73ffffffffffffffffffffffffffffffffffffffff81166107e9576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602660248201527f4f776e61626c653a206e6577206f776e657220697320746865207a65726f206160448201527f6464726573730000000000000000000000000000000000000000000000000000606482015260840161055b565b61049881610ee5565b73ffffffffffffffffffffffffffffffffffffffff8316610894576040517f08c379a0000000000000000000000000000000000000000000000000000000008152602060048201526024808201527f45524332303a20617070726f76652066726f6d20746865207a65726f2061646460448201527f7265737300000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff8216610937576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602260248201527f45524332303a20617070726f766520746f20746865207a65726f20616464726560448201527f7373000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff83811660008181526001602090815260408083209487168084529482529182902085905590518481527f8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b92591015b60405180910390a3505050565b73ffffffffffffffffffffffffffffffffffffffff8381166000908152600160209081526040808320938616835292905220547fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8114610a775781811015610a6a576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601d60248201527f45524332303a20696e73756666696369656e7420616c6c6f77616e6365000000604482015260640161055b565b610a7784848484036107f2565b50505050565b73ffffffffffffffffffffffffffffffffffffffff8316610b20576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602560248201527f45524332303a207472616e736665722066726f6d20746865207a65726f20616460448201527f6472657373000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff8216610bc3576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602360248201527f45524332303a207472616e7366657220746f20746865207a65726f206164647260448201527f6573730000000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff831660009081526020819052604090205481811015610c79576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602660248201527f45524332303a207472616e7366657220616d6f756e742065786365656473206260448201527f616c616e63650000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff808516600090815260208190526040808220858503905591851681529081208054849290610cbd9084906118f8565b925050819055508273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff167fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef84604051610d2391815260200190565b60405180910390a3610a77565b60003073ffffffffffffffffffffffffffffffffffffffff7f000000000000000000000000000000000000000000000000000000000000000016148015610d9657507f000000000000000000000000000000000000000000000000000000000000000046145b15610dc057507f000000000000000000000000000000000000000000000000000000000000000090565b50604080517f00000000000000000000000000000000000000000000000000000000000000006020808301919091527f0000000000000000000000000000000000000000000000000000000000000000828401527f000000000000000000000000000000000000000000000000000000000000000060608301524660808301523060a0808401919091528351808403909101815260c0909201909252805191012090565b60075473ffffffffffffffffffffffffffffffffffffffff16331461042e576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820181905260248201527f4f776e61626c653a2063616c6c6572206973206e6f7420746865206f776e6572604482015260640161055b565b6007805473ffffffffffffffffffffffffffffffffffffffff8381167fffffffffffffffffffffffff0000000000000000000000000000000000000000831681179093556040519116919082907f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e090600090a35050565b73ffffffffffffffffffffffffffffffffffffffff8216610fff576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602160248201527f45524332303a206275726e2066726f6d20746865207a65726f2061646472657360448201527f7300000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff8216600090815260208190526040902054818110156110b5576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602260248201527f45524332303a206275726e20616d6f756e7420657863656564732062616c616e60448201527f6365000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff831660009081526020819052604081208383039055600280548492906110f1908490611910565b909155505060405182815260009073ffffffffffffffffffffffffffffffffffffffff8516907fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef90602001610999565b73ffffffffffffffffffffffffffffffffffffffff82166111be576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601f60248201527f45524332303a206d696e7420746f20746865207a65726f206164647265737300604482015260640161055b565b80600260008282546111d091906118f8565b909155505073ffffffffffffffffffffffffffffffffffffffff82166000908152602081905260408120805483929061120a9084906118f8565b909155505060405181815273ffffffffffffffffffffffffffffffffffffffff8316906000907fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef9060200160405180910390a35050565b73ffffffffffffffffffffffffffffffffffffffff811660009081526005602052604090208054600181018255905b50919050565b60006104576112a3610d30565b836040517f19010000000000000000000000000000000000000000000000000000000000006020820152602281018390526042810182905260009060620160405160208183030381529060405280519060200120905092915050565b600080600061131087878787611327565b9150915061131d8161143f565b5095945050505050565b6000807f7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a083111561135e5750600090506003611436565b8460ff16601b1415801561137657508460ff16601c14155b156113875750600090506004611436565b6040805160008082526020820180845289905260ff881692820192909252606081018690526080810185905260019060a0016020604051602081039080840390855afa1580156113db573d6000803e3d6000fd5b50506040517fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0015191505073ffffffffffffffffffffffffffffffffffffffff811661142f57600060019250925050611436565b9150600090505b94509492505050565b600081600481111561145357611453611927565b141561145c5750565b600181600481111561147057611470611927565b14156114d8576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601860248201527f45434453413a20696e76616c6964207369676e61747572650000000000000000604482015260640161055b565b60028160048111156114ec576114ec611927565b1415611554576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601f60248201527f45434453413a20696e76616c6964207369676e6174757265206c656e67746800604482015260640161055b565b600381600481111561156857611568611927565b14156115f6576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602260248201527f45434453413a20696e76616c6964207369676e6174757265202773272076616c60448201527f7565000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b600481600481111561160a5761160a611927565b1415610498576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602260248201527f45434453413a20696e76616c6964207369676e6174757265202776272076616c60448201527f7565000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b600060208083528351808285015260005b818110156116c5578581018301518582016040015282016116a9565b818111156116d7576000604083870101525b50601f017fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe016929092016040019392505050565b803573ffffffffffffffffffffffffffffffffffffffff8116811461172f57600080fd5b919050565b6000806040838503121561174757600080fd5b6117508361170b565b946020939093013593505050565b60008060006060848603121561177357600080fd5b61177c8461170b565b925061178a6020850161170b565b9150604084013590509250925092565b6000602082840312156117ac57600080fd5b6117b58261170b565b9392505050565b6000602082840312156117ce57600080fd5b5035919050565b600080600080600080600060e0888a0312156117f057600080fd5b6117f98861170b565b96506118076020890161170b565b95506040880135945060608801359350608088013560ff8116811461182b57600080fd5b9699959850939692959460a0840135945060c09093013592915050565b6000806040838503121561185b57600080fd5b6118648361170b565b91506118726020840161170b565b90509250929050565b600181811c9082168061188f57607f821691505b60208210811415611290577f4e487b7100000000000000000000000000000000000000000000000000000000600052602260045260246000fd5b7f4e487b7100000000000000000000000000000000000000000000000000000000600052601160045260246000fd5b6000821982111561190b5761190b6118c9565b500190565b600082821015611922576119226118c9565b500390565b7f4e487b7100000000000000000000000000000000000000000000000000000000600052602160045260246000fdfea26469706673582212205730b41eb3bf6127251dbb860cb96d8de333b02d2311eabf14197cc48a2fafd464736f6c63430008090033",
+    "deployedBytecode": "0x608060405234801561001057600080fd5b50600436106101365760003560e01c80637ecebe00116100b2578063a457c2d711610081578063d505accf11610066578063d505accf14610287578063dd62ed3e1461029a578063f2fde38b146102e057600080fd5b8063a457c2d714610261578063a9059cbb1461027457600080fd5b80637ecebe001461020b5780638da5cb5b1461021e57806395d89b4114610246578063a0712d681461024e57600080fd5b8063313ce5671161010957806339509351116100ee57806339509351146101b857806370a08231146101cb578063715018a61461020157600080fd5b8063313ce567146101a15780633644e515146101b057600080fd5b806306fdde031461013b578063095ea7b31461015957806318160ddd1461017c57806323b872dd1461018e575b600080fd5b6101436102f3565b6040516101509190611698565b60405180910390f35b61016c610167366004611734565b610385565b6040519015158152602001610150565b6002545b604051908152602001610150565b61016c61019c36600461175e565b61039d565b60405160088152602001610150565b6101806103c1565b61016c6101c6366004611734565b6103d0565b6101806101d936600461179a565b73ffffffffffffffffffffffffffffffffffffffff1660009081526020819052604090205490565b61020961041c565b005b61018061021936600461179a565b610430565b60075460405173ffffffffffffffffffffffffffffffffffffffff9091168152602001610150565b61014361045d565b61020961025c3660046117bc565b61046c565b61016c61026f366004611734565b61049b565b61016c610282366004611734565b610571565b6102096102953660046117d5565b61057f565b6101806102a8366004611848565b73ffffffffffffffffffffffffffffffffffffffff918216600090815260016020908152604080832093909416825291909152205490565b6102096102ee36600461179a565b61073e565b6060600380546103029061187b565b80601f016020809104026020016040519081016040528092919081815260200182805461032e9061187b565b801561037b5780601f106103505761010080835404028352916020019161037b565b820191906000526020600020905b81548152906001019060200180831161035e57829003601f168201915b5050505050905090565b6000336103938185856107f2565b5060019392505050565b6000336103ab8582856109a6565b6103b6858585610a7d565b506001949350505050565b60006103cb610d30565b905090565b33600081815260016020908152604080832073ffffffffffffffffffffffffffffffffffffffff8716845290915281205490919061039390829086906104179087906118f8565b6107f2565b610424610e64565b61042e6000610ee5565b565b73ffffffffffffffffffffffffffffffffffffffff81166000908152600560205260408120545b92915050565b6060600480546103029061187b565b610474610e64565b3360008181526020819052604090205461048e9190610f5c565b6104983382611141565b50565b33600081815260016020908152604080832073ffffffffffffffffffffffffffffffffffffffff8716845290915281205490919083811015610564576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602560248201527f45524332303a2064656372656173656420616c6c6f77616e63652062656c6f7760448201527f207a65726f00000000000000000000000000000000000000000000000000000060648201526084015b60405180910390fd5b6103b682868684036107f2565b600033610393818585610a7d565b834211156105e9576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601d60248201527f45524332305065726d69743a206578706972656420646561646c696e65000000604482015260640161055b565b60007f6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c98888886106188c611261565b60408051602081019690965273ffffffffffffffffffffffffffffffffffffffff94851690860152929091166060840152608083015260a082015260c0810186905260e001604051602081830303815290604052805190602001209050600061068082611296565b90506000610690828787876112ff565b90508973ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614610727576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601e60248201527f45524332305065726d69743a20696e76616c6964207369676e61747572650000604482015260640161055b565b6107328a8a8a6107f2565b50505050505050505050565b610746610e64565b73ffffffffffffffffffffffffffffffffffffffff81166107e9576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602660248201527f4f776e61626c653a206e6577206f776e657220697320746865207a65726f206160448201527f6464726573730000000000000000000000000000000000000000000000000000606482015260840161055b565b61049881610ee5565b73ffffffffffffffffffffffffffffffffffffffff8316610894576040517f08c379a0000000000000000000000000000000000000000000000000000000008152602060048201526024808201527f45524332303a20617070726f76652066726f6d20746865207a65726f2061646460448201527f7265737300000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff8216610937576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602260248201527f45524332303a20617070726f766520746f20746865207a65726f20616464726560448201527f7373000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff83811660008181526001602090815260408083209487168084529482529182902085905590518481527f8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b92591015b60405180910390a3505050565b73ffffffffffffffffffffffffffffffffffffffff8381166000908152600160209081526040808320938616835292905220547fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8114610a775781811015610a6a576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601d60248201527f45524332303a20696e73756666696369656e7420616c6c6f77616e6365000000604482015260640161055b565b610a7784848484036107f2565b50505050565b73ffffffffffffffffffffffffffffffffffffffff8316610b20576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602560248201527f45524332303a207472616e736665722066726f6d20746865207a65726f20616460448201527f6472657373000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff8216610bc3576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602360248201527f45524332303a207472616e7366657220746f20746865207a65726f206164647260448201527f6573730000000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff831660009081526020819052604090205481811015610c79576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602660248201527f45524332303a207472616e7366657220616d6f756e742065786365656473206260448201527f616c616e63650000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff808516600090815260208190526040808220858503905591851681529081208054849290610cbd9084906118f8565b925050819055508273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff167fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef84604051610d2391815260200190565b60405180910390a3610a77565b60003073ffffffffffffffffffffffffffffffffffffffff7f000000000000000000000000000000000000000000000000000000000000000016148015610d9657507f000000000000000000000000000000000000000000000000000000000000000046145b15610dc057507f000000000000000000000000000000000000000000000000000000000000000090565b50604080517f00000000000000000000000000000000000000000000000000000000000000006020808301919091527f0000000000000000000000000000000000000000000000000000000000000000828401527f000000000000000000000000000000000000000000000000000000000000000060608301524660808301523060a0808401919091528351808403909101815260c0909201909252805191012090565b60075473ffffffffffffffffffffffffffffffffffffffff16331461042e576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820181905260248201527f4f776e61626c653a2063616c6c6572206973206e6f7420746865206f776e6572604482015260640161055b565b6007805473ffffffffffffffffffffffffffffffffffffffff8381167fffffffffffffffffffffffff0000000000000000000000000000000000000000831681179093556040519116919082907f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e090600090a35050565b73ffffffffffffffffffffffffffffffffffffffff8216610fff576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602160248201527f45524332303a206275726e2066726f6d20746865207a65726f2061646472657360448201527f7300000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff8216600090815260208190526040902054818110156110b5576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602260248201527f45524332303a206275726e20616d6f756e7420657863656564732062616c616e60448201527f6365000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b73ffffffffffffffffffffffffffffffffffffffff831660009081526020819052604081208383039055600280548492906110f1908490611910565b909155505060405182815260009073ffffffffffffffffffffffffffffffffffffffff8516907fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef90602001610999565b73ffffffffffffffffffffffffffffffffffffffff82166111be576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601f60248201527f45524332303a206d696e7420746f20746865207a65726f206164647265737300604482015260640161055b565b80600260008282546111d091906118f8565b909155505073ffffffffffffffffffffffffffffffffffffffff82166000908152602081905260408120805483929061120a9084906118f8565b909155505060405181815273ffffffffffffffffffffffffffffffffffffffff8316906000907fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef9060200160405180910390a35050565b73ffffffffffffffffffffffffffffffffffffffff811660009081526005602052604090208054600181018255905b50919050565b60006104576112a3610d30565b836040517f19010000000000000000000000000000000000000000000000000000000000006020820152602281018390526042810182905260009060620160405160208183030381529060405280519060200120905092915050565b600080600061131087878787611327565b9150915061131d8161143f565b5095945050505050565b6000807f7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a083111561135e5750600090506003611436565b8460ff16601b1415801561137657508460ff16601c14155b156113875750600090506004611436565b6040805160008082526020820180845289905260ff881692820192909252606081018690526080810185905260019060a0016020604051602081039080840390855afa1580156113db573d6000803e3d6000fd5b50506040517fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0015191505073ffffffffffffffffffffffffffffffffffffffff811661142f57600060019250925050611436565b9150600090505b94509492505050565b600081600481111561145357611453611927565b141561145c5750565b600181600481111561147057611470611927565b14156114d8576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601860248201527f45434453413a20696e76616c6964207369676e61747572650000000000000000604482015260640161055b565b60028160048111156114ec576114ec611927565b1415611554576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152601f60248201527f45434453413a20696e76616c6964207369676e6174757265206c656e67746800604482015260640161055b565b600381600481111561156857611568611927565b14156115f6576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602260248201527f45434453413a20696e76616c6964207369676e6174757265202773272076616c60448201527f7565000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b600481600481111561160a5761160a611927565b1415610498576040517f08c379a000000000000000000000000000000000000000000000000000000000815260206004820152602260248201527f45434453413a20696e76616c6964207369676e6174757265202776272076616c60448201527f7565000000000000000000000000000000000000000000000000000000000000606482015260840161055b565b600060208083528351808285015260005b818110156116c5578581018301518582016040015282016116a9565b818111156116d7576000604083870101525b50601f017fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe016929092016040019392505050565b803573ffffffffffffffffffffffffffffffffffffffff8116811461172f57600080fd5b919050565b6000806040838503121561174757600080fd5b6117508361170b565b946020939093013593505050565b60008060006060848603121561177357600080fd5b61177c8461170b565b925061178a6020850161170b565b9150604084013590509250925092565b6000602082840312156117ac57600080fd5b6117b58261170b565b9392505050565b6000602082840312156117ce57600080fd5b5035919050565b600080600080600080600060e0888a0312156117f057600080fd5b6117f98861170b565b96506118076020890161170b565b95506040880135945060608801359350608088013560ff8116811461182b57600080fd5b9699959850939692959460a0840135945060c09093013592915050565b6000806040838503121561185b57600080fd5b6118648361170b565b91506118726020840161170b565b90509250929050565b600181811c9082168061188f57607f821691505b60208210811415611290577f4e487b7100000000000000000000000000000000000000000000000000000000600052602260045260246000fd5b7f4e487b7100000000000000000000000000000000000000000000000000000000600052601160045260246000fd5b6000821982111561190b5761190b6118c9565b500190565b600082821015611922576119226118c9565b500390565b7f4e487b7100000000000000000000000000000000000000000000000000000000600052602160045260246000fdfea26469706673582212205730b41eb3bf6127251dbb860cb96d8de333b02d2311eabf14197cc48a2fafd464736f6c63430008090033",
+    "linkReferences": {},
+    "deployedLinkReferences": {},
+}
+
+creation_nonce: int
+if SHOULD_DEPLOY_CONTRACT:
+    Purr = w3.eth.contract(abi=purr_abi["abi"], bytecode=purr_abi["bytecode"])
+    creation_nonce = w3.eth.get_transaction_count(account.address)
+    tx_hash = Purr.constructor().transact()
+    print("constructor tx_hash", tx_hash, creation_nonce)
+    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    print("constructor tx_receipt", tx_receipt)
+    contract_address = tx_receipt["contractAddress"]
+    purr = w3.eth.contract(address=contract_address, abi=purr_abi["abi"])
+
+    initial_supply = w3.to_wei(1_000_000_000, "ether")  # this should match the max supply on the L1
+    tx_hash = purr.functions.mint(initial_supply).transact()
+    print("mint tx_hash", tx_hash)
+    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    print("mint tx_receipt", tx_receipt)
+
+    tx_hash = purr.functions.transfer("0x2222222222222222222222222222222222222222", initial_supply).transact()
+    print("transfer tx_hash", tx_hash)
+    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    print("transfer tx_receipt", tx_receipt)
+    print(purr.functions.balanceOf("0x2222222222222222222222222222222222222222").call())
+else:
+    contract_address = DEFAULT_CONTRACT_ADDRESS
+    creation_nonce = 0
+
+if SHOULD_LINK_CONTRACT:
+    if contract_address is None:
+        raise Exception("contract address cannot be None")
+    action = {
+        "type": "spotDeploy",
+        "requestEvmContract": {
+            "token": TOKEN,
+            "address": contract_address.lower(),
+            "evmExtraWeiDecimals": 13,
+        },
+    }
+    nonce = get_timestamp_ms()
+    signature = sign_l1_action(account, action, None, nonce, False)
+    payload = {
+        "action": action,
+        "nonce": nonce,
+        "signature": signature,
+        "vaultAddress": None,
+    }
+    response = requests.post(constants.TESTNET_API_URL + "/exchange", json=payload, timeout=10)
+    print(response.json())
+
+    use_create_finalization = True
+    finalize_action: FinalizeEvmContractAction
+    if use_create_finalization:
+        finalize_action = {
+            "type": "finalizeEvmContract",
+            "token": TOKEN,
+            "input": {"create": {"nonce": creation_nonce}},
+        }
+    else:
+        finalize_action = {"type": "finalizeEvmContract", "token": TOKEN, "input": "firstStorageSlot"}
+    nonce = get_timestamp_ms()
+    signature = sign_l1_action(account, finalize_action, None, nonce, False)
+    payload = {
+        "action": finalize_action,
+        "nonce": nonce,
+        "signature": signature,
+        "vaultAddress": None,
+    }
+    response = requests.post(constants.TESTNET_API_URL + "/exchange", json=payload, timeout=10)
+    print(response.json())
+
+
+
+---
+File: /examples/example_utils.py
+---
+
+import json
+import os
+
+import eth_account
+from eth_account.signers.local import LocalAccount
+
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+
+
+def setup(base_url=None, skip_ws=False):
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+    account: LocalAccount = eth_account.Account.from_key(config["secret_key"])
+    address = config["account_address"]
+    if address == "":
+        address = account.address
+    print("Running with account address:", address)
+    if address != account.address:
+        print("Running with agent address:", account.address)
+    info = Info(base_url, skip_ws)
+    user_state = info.user_state(address)
+    spot_user_state = info.spot_user_state(address)
+    margin_summary = user_state["marginSummary"]
+    if float(margin_summary["accountValue"]) == 0 and len(spot_user_state["balances"]) == 0:
+        print("Not running the example because the provided account has no equity.")
+        url = info.base_url.split(".", 1)[1]
+        error_string = f"No accountValue:\nIf you think this is a mistake, make sure that {address} has a balance on {url}.\nIf address shown is your API wallet address, update the config to specify the address of your account, not the address of the API wallet."
+        raise Exception(error_string)
+    exchange = Exchange(account, base_url, account_address=address)
+    return address, info, exchange
+
+
+def setup_multi_sig_wallets():
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+
+    authorized_user_wallets = []
+    for wallet_config in config["multi_sig"]["authorized_users"]:
+        account: LocalAccount = eth_account.Account.from_key(wallet_config["secret_key"])
+        address = wallet_config["account_address"]
+        if account.address != address:
+            raise Exception(f"provided authorized user address {address} does not match private key")
+        print("loaded authorized user for multi-sig", address)
+        authorized_user_wallets.append(account)
+    return authorized_user_wallets
+
+
+
+---
+File: /examples/multi_sig_order.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+from hyperliquid.utils.signing import get_timestamp_ms, sign_multi_sig_l1_action_payload
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+    multi_sig_wallets = example_utils.setup_multi_sig_wallets()
+
+    # The outer signer is required to be an authorized user or an agent of the authorized user of the multi-sig user.
+
+    # Address of the multi-sig user that the action will be executed for
+    # Executing the action requires at least the specified threshold of signatures
+    # required for that multi-sig user
+    multi_sig_user = "0x0000000000000000000000000000000000000005"
+
+    timestamp = get_timestamp_ms()
+
+    # Define the multi-sig inner action
+    action = {
+        "type": "order",
+        "orders": [{"a": 4, "b": True, "p": "1100", "s": "0.2", "r": False, "t": {"limit": {"tif": "Gtc"}}}],
+        "grouping": "na",
+    }
+
+    timestamp = get_timestamp_ms()
+    signatures = []
+
+    # Collect signatures from each wallet in multi_sig_wallets. Each wallet must belong to a user.
+    for wallet in multi_sig_wallets:
+        # Sign the action with each wallet
+        signature = sign_multi_sig_l1_action_payload(
+            wallet,
+            action,
+            exchange.base_url == constants.MAINNET_API_URL,
+            None,
+            timestamp,
+            multi_sig_user,
+            address,
+        )
+        signatures.append(signature)
+
+    # Execute the multi-sig action with all collected signatures
+    # This will only succeed if enough valid signatures are provided
+    multi_sig_result = exchange.multi_sig(multi_sig_user, action, signatures, timestamp)
+    print(multi_sig_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/multi_sig_register_token.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+from hyperliquid.utils.signing import get_timestamp_ms, sign_multi_sig_l1_action_payload
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+    multi_sig_wallets = example_utils.setup_multi_sig_wallets()
+
+    # The outer signer is required to be an authorized user or an agent of the authorized user of the multi-sig user.
+
+    # Address of the multi-sig user that the action will be executed for
+    # Executing the action requires at least the specified threshold of signatures
+    # required for that multi-sig user
+    multi_sig_user = "0x0000000000000000000000000000000000000005"
+
+    timestamp = get_timestamp_ms()
+
+    # Define the multi-sig inner action
+    action = {
+        "type": "spotDeploy",
+        "registerToken2": {
+            "spec": {"name": "TESTH", "szDecimals": 2, "weiDecimals": 8},
+            "maxGas": 1000000000000,
+            "fullName": "Example multi-sig spot deploy",
+        },
+    }
+
+    timestamp = get_timestamp_ms()
+    signatures = []
+
+    # Collect signatures from each wallet in multi_sig_wallets. Each wallet must belong to a user.
+    for wallet in multi_sig_wallets:
+        # Sign the action with each wallet
+        signature = sign_multi_sig_l1_action_payload(
+            wallet,
+            action,
+            exchange.base_url == constants.MAINNET_API_URL,
+            None,
+            timestamp,
+            multi_sig_user,
+            address,
+        )
+        signatures.append(signature)
+
+    # Execute the multi-sig action with all collected signatures
+    # This will only succeed if enough valid signatures are provided
+    multi_sig_result = exchange.multi_sig(multi_sig_user, action, signatures, timestamp)
+    print(multi_sig_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/multi_sig_usd_send.py
+---
+
+import example_utils
+
+from hyperliquid.utils import constants
+from hyperliquid.utils.signing import USD_SEND_SIGN_TYPES, get_timestamp_ms, sign_multi_sig_user_signed_action_payload
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+    multi_sig_wallets = example_utils.setup_multi_sig_wallets()
+
+    # The outer signer is required to be an authorized user or an agent of the authorized user of the multi-sig user.
+
+    # Address of the multi-sig user that the action will be executed for
+    # Executing the action requires at least the specified threshold of signatures
+    # required for that multi-sig user
+    multi_sig_user = "0x0000000000000000000000000000000000000005"
+
+    timestamp = get_timestamp_ms()
+
+    # Define the multi-sig inner action - in this case, sending USD
+    action = {
+        "type": "usdSend",
+        "signatureChainId": "0x66eee",
+        "hyperliquidChain": "Testnet",
+        "destination": "0x0000000000000000000000000000000000000000",
+        "amount": "100.0",
+        "time": timestamp,
+    }
+    signatures = []
+
+    # Collect signatures from each wallet in multi_sig_wallets. Each wallet must belong to a user.
+    for wallet in multi_sig_wallets:
+        # Sign the action with each wallet
+        signature = sign_multi_sig_user_signed_action_payload(
+            wallet,
+            action,
+            exchange.base_url == constants.MAINNET_API_URL,
+            USD_SEND_SIGN_TYPES,
+            "HyperliquidTransaction:UsdSend",
+            multi_sig_user,
+            address,
+        )
+        signatures.append(signature)
+
+    # Execute the multi-sig action with all collected signatures
+    # This will only succeed if enough valid signatures are provided
+    multi_sig_result = exchange.multi_sig(multi_sig_user, action, signatures, timestamp)
+    print(multi_sig_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/rounding.py
+---
+
+"""
+This example demonstrates how to round numbers when placing orders.
+Both Price (px) and Size (sz) have a maximum number of decimals that are accepted.
+Prices can have up to 5 significant figures, but no more than MAX_DECIMALS - szDecimals decimal places where MAX_DECIMALS is 6 for perps and 8 for spot.
+For example, for perps, 1234.5 is valid but 1234.56 is not (too many significant figures).
+0.001234 is valid, but 0.0012345 is not (more than 6 decimal places).
+For spot, 0.0001234 is valid if szDecimals is 0 or 1, but not if szDecimals is greater than 2 (more than 8-2 decimal places).
+Integer prices are always allowed, regardless of the number of significant figures. E.g. 123456.0 is a valid price even though 12345.6 is not.
+Prices are precise to the lesser of 5 significant figures or 6 decimals.
+You can find the szDecimals for an asset by making a meta request to the info endpoint
+"""
+
+import json
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    # Get the exchange's metadata and print it out
+    meta = info.meta()
+    print(json.dumps(meta, indent=2))
+
+    # create a szDecimals map
+    sz_decimals = {}
+    for asset_info in meta["universe"]:
+        sz_decimals[asset_info["name"]] = asset_info["szDecimals"]
+
+    # For demonstration purposes we'll start with a price and size that have too many digits
+    sz = 12.345678
+    px = 1.2345678
+    coin = "OP"
+    max_decimals = 6  # change to 8 for spot
+
+    # If you use these directly, the exchange will return an error, so we round them.
+    # First we check if price is greater than 100k in which case we just need to round to an integer
+    if px > 100_000:
+        px = round(px)
+    # If not we round px to 5 significant figures and max_decimals - szDecimals decimals
+    else:
+        px = round(float(f"{px:.5g}"), max_decimals - sz_decimals[coin])
+
+    # Next we round sz based on the sz_decimals map we created
+    sz = round(sz, sz_decimals[coin])
+
+    print(f"placing order with px {px} and sz {sz}")
+    order_result = exchange.order(coin, True, sz, px, {"limit": {"tif": "Gtc"}})
+    print(order_result)
+
+    # Cancel the order
+    if order_result["status"] == "ok":
+        status = order_result["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            cancel_result = exchange.cancel(coin, status["resting"]["oid"])
+            print(cancel_result)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /examples/spot_deploy.py
+---
+
+# Example script to deploy HIP-1 and HIP-2 assets
+# See https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/deploying-hip-1-and-hip-2-assets
+# for the spec.
+#
+# IMPORTANT: Replace any arguments for the exchange calls below to match your deployment requirements.
+
+import example_utils
+
+from hyperliquid.utils import constants
+
+# Set to True to enable freeze functionality for the deployed token
+# See step 2-a below for more details on freezing.
+ENABLE_FREEZE_PRIVILEGE = False
+DUMMY_USER = "0x0000000000000000000000000000000000000001"
+
+
+def main():
+    address, info, exchange = example_utils.setup(constants.TESTNET_API_URL, skip_ws=True)
+
+    # Step 1: Registering the Token
+    #
+    # Takes part in the spot deploy auction and if successful, registers token "TEST0"
+    # with sz_decimals 2 and wei_decimals 8.
+    # The max gas is $1M USDC and represents the max amount to be paid for the spot deploy auction.
+    register_token_result = exchange.spot_deploy_register_token("TEST0", 2, 8, 1000000000000, "Test token example")
+    print(register_token_result)
+    # If registration is successful, a token index will be returned. This token index is required for
+    # later steps in the spot deploy process.
+    if register_token_result["status"] == "ok":
+        token = register_token_result["response"]["data"]
+    else:
+        return
+
+    # Step 2: User Genesis
+    #
+    # User genesis can be called multiple times to associate balances to specific users and/or
+    # tokens for genesis.
+    #
+    # Associate 100000000000000 wei with user 0x0000000000000000000000000000000000000001
+    # Associate 100000000000000 wei with hyperliquidity
+    user_genesis_result = exchange.spot_deploy_user_genesis(
+        token,
+        [
+            (DUMMY_USER, "100000000000000"),
+            ("0xffffffffffffffffffffffffffffffffffffffff", "100000000000000"),
+        ],
+        [],
+    )
+    print(user_genesis_result)
+    # No-op
+    user_genesis_result = exchange.spot_deploy_user_genesis(token, [], [])
+    print(user_genesis_result)
+    # Distribute 100000000000000 wei on a weighted basis to all holders of token with index 1
+    user_genesis_result = exchange.spot_deploy_user_genesis(token, [], [(1, "100000000000000")])
+    print(user_genesis_result)
+
+    if ENABLE_FREEZE_PRIVILEGE:
+        # Step 2-a: Enables the deployer to freeze/unfreeze users. Freezing a user means
+        # that user cannot trade, send, or receive this token.
+        enable_freeze_privilege_result = exchange.spot_deploy_enable_freeze_privilege(token)
+        print(enable_freeze_privilege_result)
+
+        # Freeze user for token
+        freeze_user_result = exchange.spot_deploy_freeze_user(token, DUMMY_USER, True)
+        print(freeze_user_result)
+
+        # Unfreeze user for token
+        unfreeze_user_result = exchange.spot_deploy_freeze_user(token, DUMMY_USER, False)
+        print(unfreeze_user_result)
+
+    # Step 3: Genesis
+    #
+    # Finalize genesis. The max supply of 300000000000000 wei needs to match the total
+    # allocation above from user genesis.
+    #
+    # "noHyperliquidity" can also be set to disable hyperliquidity. In that case, no balance
+    # should be associated with hyperliquidity from step 2 (user genesis).
+    genesis_result = exchange.spot_deploy_genesis(token, "300000000000000", False)
+    print(genesis_result)
+
+    # Step 4: Register Spot
+    #
+    # Register the spot pair (TEST0/USDC) given base and quote token indices. 0 represents USDC.
+    # The base token is the first token in the pair and the quote token is the second token.
+    register_spot_result = exchange.spot_deploy_register_spot(token, 0)
+    print(register_spot_result)
+    # If registration is successful, a spot index will be returned. This spot index is required for
+    # registering hyperliquidity.
+    if register_token_result["status"] == "ok":
+        spot = register_token_result["response"]["data"]
+    else:
+        return
+
+    # Step 5: Register Hyperliquidity
+    #
+    # Registers hyperliquidity for the spot pair. In this example, hyperliquidity is registered
+    # with a starting price of $2, an order size of 4, and 100 total orders.
+    #
+    # This step is required even if "noHyperliquidity" was set to True.
+    # If "noHyperliquidity" was set to True during step 3 (genesis), then "n_orders" is required to be 0.
+    register_hyperliquidity_result = exchange.spot_deploy_register_hyperliquidity(spot, 2.0, 4.0, 100, None)
+    print(register_hyperliquidity_result)
+
+
+if __name__ == "__main__":
+    main()
+

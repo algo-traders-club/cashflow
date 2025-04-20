@@ -1,0 +1,61 @@
+###############################################
+# Cashflow Trading System Configuration
+###############################################
+
+# Agent configuration
+agent:
+  check_interval: 60  # seconds between strategy checks
+  log_level: "INFO"   # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# Data configuration
+data:
+  db_path: "data/market_data.db"
+  candle_intervals:
+    - "1m"
+    - "5m"
+  historical_days:
+    "1m": 7
+    "5m": 30
+
+# Strategy configuration
+strategy:
+  # Bollinger Bands parameters
+  bb_period: 20
+  bb_std_dev: 1.5
+  
+  # RSI parameters
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+  
+  # Trend following parameters
+  ema_period: 50
+  adx_period: 14
+  adx_threshold: 25
+  
+  # Exit parameters - configured for quick exits
+  atr_period: 14
+  take_profit_atr_multiple: 1.2  # Take profits sooner
+  stop_loss_atr_multiple: 0.4    # Tighter stop losses
+  time_exit_minutes: 15          # Shorter time-based exits
+
+# Execution configuration
+execution:
+  # Risk parameters - configured for minimal risk with $22 USDC balance
+  max_position_size: 0.02       # 2% of portfolio (very conservative)
+  max_trade_risk: 0.005         # 0.5% per trade (tight risk control)
+  circuit_breaker_drawdown: 0.02  # 2% daily drawdown (tight circuit breaker)
+  circuit_breaker_consecutive_losses: 2  # Stop after 2 consecutive losses
+  
+  # Execution parameters
+  twap_volume_threshold: 0.005  # 0.5% of average volume
+  iceberg_size_threshold: 0.01  # 1% of portfolio
+  stale_order_timeout: 300      # 5 minutes
+  initial_portfolio_value: 22.0  # Set to actual balance
+
+# API configuration
+api:
+  host: "0.0.0.0"
+  port: 8000
+  enable_cors: true
+  rate_limit: 100  # requests per minute

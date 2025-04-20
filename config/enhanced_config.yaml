@@ -1,0 +1,98 @@
+# Enhanced Cashflow Trading System Configuration
+
+# Agent configuration
+agent:
+  check_interval: 60  # seconds between strategy checks
+  log_level: "INFO"   # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# Data configuration
+data:
+  db_path: "data/market_data.db"
+  candle_intervals:
+    - "1m"
+    - "5m"
+    - "1d"  # Added for volatility calculation
+  historical_days:
+    "1m": 7
+    "5m": 30
+    "1d": 30  # For volatility-based position sizing
+
+# Strategy configuration
+strategy:
+  # Base strategy parameters
+  bb_period: 20
+  bb_std_dev: 1.25  # Reduced from 1.5 for more signals
+  rsi_period: 14
+  rsi_oversold: 25  # Reduced from 30 for more aggressive buy signals
+  rsi_overbought: 75  # Increased from 70 for more aggressive sell signals
+  ema_period: 50
+  adx_period: 14
+  adx_threshold: 25
+  
+  # Exit parameters
+  atr_period: 14
+  take_profit_atr_multiple: 1.5  # Increased from 1.2 for larger profits
+  stop_loss_atr_multiple: 0.6    # Widened from 0.4 to allow more room for price movement
+  time_exit_minutes: 30          # Extended from 15 to allow trades more time to develop
+  
+  # Enhanced strategy parameters
+  volume_confirmation: true
+  volume_lookback: 5  # candles
+  volume_threshold: 1.25  # Reduced from 1.5 (125% of average) for more signals
+  
+  time_filters_enabled: true
+  low_liquidity_hours: [0, 1, 2, 3]  # UTC hours
+  
+  regime_detection: true
+  trend_lookback: 20  # candles
+
+# Execution configuration
+execution:
+  # Risk parameters
+  max_position_size: 0.05       # Increased from 0.02 to 5% of portfolio for more aggressive trading
+  max_trade_risk: 0.01         # Increased from 0.005 to 1% per trade for more aggressive risk taking
+  circuit_breaker_drawdown: 0.05  # Increased from 0.02 to 5% daily drawdown limit
+  circuit_breaker_consecutive_losses: 3  # Increased from 2 to 3 consecutive losses before stopping
+  
+  # Enhanced risk parameters
+  volatility_lookback: 14  # days
+  max_volatility_adjustment: 0.3  # Reduced from 0.5 to 30% size reduction for more aggressive sizing
+  volatility_floor: 0.01  # 1% daily volatility
+  volatility_ceiling: 0.08  # Increased from 0.05 to 8% daily volatility tolerance
+  dynamic_circuit_breaker: true
+  
+  # Execution parameters
+  twap_volume_threshold: 0.005  # 0.5% of average volume
+  iceberg_size_threshold: 0.01  # 1% of portfolio
+  stale_order_timeout: 300      # 5 minutes
+  initial_portfolio_value: 22.0  # Set to actual balance
+  
+  # Adaptive execution parameters
+  adaptive_execution: true
+  min_liquidity_score: 0.2  # Reduced from 0.3 to allow trading in less liquid conditions
+  max_volatility_for_market_orders: 0.9  # Increased from 0.7 to allow market orders in more volatile conditions
+  size_threshold_for_twap: 0.02  # Increased from 0.01 to 2% of avg volume
+
+# API configuration
+api:
+  host: "0.0.0.0"
+  port: 9000
+  enable_cors: true
+  rate_limit: 100  # requests per minute
+
+# Metrics configuration
+metrics:
+  enabled: true
+  prometheus_port: 9090
+  history_size: 1000  # Maximum number of trades to keep in memory
+  
+  # New aggressive trading metrics
+  track_aggression_ratio: true  # Track trades taken vs opportunities
+  track_position_distribution: true  # Track position size distribution
+  track_risk_adjusted_returns: true  # Track risk-adjusted return metrics
+  track_aggression_coefficient: true  # Track actual vs max possible position sizing
+  
+# Hyperliquid API configuration
+hyperliquid:
+  api_url: "https://api.hyperliquid.xyz"  # Mainnet API URL
+  ws_url: "wss://api.hyperliquid.xyz/ws"  # Mainnet WebSocket URL

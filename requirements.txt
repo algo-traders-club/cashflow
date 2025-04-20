@@ -1,0 +1,13 @@
+fastapi>=0.104.0
+uvicorn>=0.23.2
+hyperliquid-python-sdk>=0.1.0
+python-dotenv>=1.0.0
+pandas>=2.1.1
+numpy>=1.26.0
+websockets>=11.0.3
+aiohttp>=3.8.5
+pydantic>=2.4.2
+pyjwt>=2.8.0
+sqlalchemy>=2.0.21
+pyyaml>=6.0.1
+prometheus-client>=0.17.1
